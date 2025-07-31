@@ -37,9 +37,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from import_nanogpt import model
 from order import apply_order, order
-from sigmagpt import sigmaGPT
+from sigmagpt import aoGPT, sigmaGPT
 
-order_type = "random"  # 'left-to-right', 'fractal', 'random', 'randomcurriculum'
+torch.autograd.set_detect_anomaly(True)  # useful for debugging 
+
+order_type = (
+    "curriculum:block-conditioning"  # 'left-to-right', 'fractal', 'random', 'randomcurriculum'
+)
+model_type = "aoGPT"  # 'sigmaGPT', 'aoGPT'
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -51,12 +56,13 @@ eval_only = False  # if True, script exits right after the first eval
 always_save_checkpoint = True  # if True, always save a checkpoint after each eval
 init_from = "scratch"  # 'scratch' or 'resume'
 # wandb logging
-wandb_log = False  # disabled by default
-wandb_project = "owt"
-wandb_run_name = "gpt2"  # 'run' + str(time.time())
+wandb_log = True  # disabled by default
+wandb_project = "ao-gpt"
+wandb_run_name = "test"  # 'run' + str(time.time())
 # data
 dataset = "openwebtext"
-gradient_accumulation_steps = 5 * 8  # used to simulate larger batch sizes
+data_dir_prefix = "/network/scratch/l/leo.gagnon/sigma-gpt-data"
+gradient_accumulation_steps = 1 # 5 * 8 #5 * 8  # used to simulate larger batch sizes
 batch_size = 12  # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
@@ -88,7 +94,7 @@ dtype = (
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     else "float16"
 )  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True  # use PyTorch 2.0 to compile the model to be faster
+compile = False  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -96,7 +102,7 @@ config_keys = [
     if not k.startswith("_") and isinstance(v, (int, float, bool, str))
 ]
 exec(
-    open("nanoGPT/configurator.py").read()
+    open("text/nanoGPT/configurator.py").read()
 )  # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
@@ -150,7 +156,7 @@ print("Before data loading...")
 # print(f"Current memory usage: {virtual_memory().used / (1024 ** 3):.2f} GB")
 
 # poor man's data loader
-data_dir = os.path.join("nanoGPT/data", dataset)
+data_dir = os.path.join(data_dir_prefix, dataset)
 train_data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=np.uint16, mode="r")
 val_data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=np.uint16, mode="r")
 print("Data Loaded...")
@@ -170,13 +176,20 @@ def get_batch(split, order_type=order_type, it=None):
             "left-to-right" if torch.rand(1).item() > (it / max_iters) else "random"
         )
 
+    if order_type.startswith("curriculum:"):
+        order_type = (
+            order_type.split(":")[1]
+            if torch.rand(1).item() > (it / max_iters)
+            else "left-to-right"
+        )
+
     if order_type.startswith("randcur:"):
         perc = float(order_type.split(":")[1]) / 100
         ratio = perc + (it / max_iters) * (1 - perc)
         order_type = "left-to-right" if torch.rand(1).item() > ratio else "random"
 
     o = order(x, 0, order_type).contiguous()
-    x, y = apply_order(x, o)
+    y = x.clone()  # y is the original target (no permutation applied)
 
     if device_type == "cuda":
         # pin arrays x,y,o which allows us to move them to GPU asynchronously (non_blocking=True)
@@ -222,7 +235,13 @@ if init_from == "scratch":
         )
     model_args["vocab_size"] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = model.GPTConfig(**model_args)
-    model = sigmaGPT(gptconf)
+    if model_type == "sigmaGPT":
+        print("Creating a sigmaGPT model")
+        model = sigmaGPT(gptconf)
+    elif model_type == "aoGPT":
+        print("Creating an aoGPT model")
+        gptconf.block_size = gptconf.block_size + int(gptconf.block_size * 0.5)
+        model = aoGPT(gptconf)
 elif init_from == "resume":
     print(f"Resuming training from {out_dir}")
     # print(f"Current memory usage: {virtual_memory().used / (1024 ** 3):.2f} GB")
@@ -253,17 +272,18 @@ elif init_from == "resume":
 
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args[
-        "block_size"
-    ] = block_size  # so that the checkpoint will have the right value
+    if False:
+        model.crop_block_size(block_size)
+        model_args["block_size"] = (
+            block_size  # so that the checkpoint will have the right value
+        )
 model.to(device)
 
 print("Settings up optimizer")
 # print(f"Current memory usage: {virtual_memory().used / (1024 ** 3):.2f} GB")
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
+scaler = torch.amp.GradScaler('cuda', enabled=(dtype == "float16"))
 
 # optimizer
 optimizer = model.configure_optimizers(
@@ -284,7 +304,7 @@ if compile:
 if ddp:
     print("wrapping model into DDP container")
     # print(f"Current memory usage: {virtual_memory().used / (1024 ** 3):.2f} GB")
-    model = DDP(model, device_ids=[ddp_local_rank])
+    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
     print("done wrapping model into DDP container")
     # print(f"Current memory usage: {virtual_memory().used / (1024 ** 3):.2f} GB")
 
@@ -356,7 +376,7 @@ while True:
     # print(f"Current memory usage: {virtual_memory().used / (1024 ** 3):.2f} GB")
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num % eval_interval == 0 and master_process and False:
         losses = estimate_loss(iter_num)
         print(
             f"step {iter_num}: train loss {losses['train']:.4f},"

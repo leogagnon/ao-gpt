@@ -1,0 +1,13 @@
+Starting training loop
+Traceback (most recent call last):
+  File "/home/mila/l/leo.gagnon/sigma-gpt/text/train.py", line 339, in <module>
+    X, O, Y = get_batch("train", it=0)  # fetch the very first batch
+  File "/home/mila/l/leo.gagnon/sigma-gpt/text/train.py", line 179, in get_batch
+    o = order(x, 0, order_type).contiguous()
+  File "/home/mila/l/leo.gagnon/sigma-gpt/text/order.py", line 80, in order
+    block_starts = torch.randint(1, T - block_sizes + 1, (B,), device=x.device)
+TypeError: randint() received an invalid combination of arguments - got (int, Tensor, tuple, device=torch.device), but expected one of:
+ * (int high, tuple of ints size, *, torch.Generator generator, Tensor out, torch.dtype dtype, torch.layout layout, torch.device device, bool pin_memory, bool requires_grad)
+ * (int high, tuple of ints size, *, Tensor out, torch.dtype dtype, torch.layout layout, torch.device device, bool pin_memory, bool requires_grad)
+ * (int low, int high, tuple of ints size, *, torch.Generator generator, Tensor out, torch.dtype dtype, torch.layout layout, torch.device device, bool pin_memory, bool requires_grad)
+ * (int low, int high, tuple of ints size, *, Tensor out, torch.dtype dtype, torch.layout layout, torch.device device, bool pin_memory, bool requires_grad)

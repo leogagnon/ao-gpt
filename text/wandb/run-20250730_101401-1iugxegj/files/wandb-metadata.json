@@ -1,0 +1,47 @@
+{
+  "os":  "Linux-5.15.0-101-generic-x86_64-with-glibc2.35",
+  "python":  "CPython 3.10.11",
+  "startedAt":  "2025-07-30T14:14:01.704855Z",
+  "args":  [
+    "--batch_size=32",
+    "--compile=False"
+  ],
+  "program":  "/home/mila/l/leo.gagnon/sigma-gpt/text/train.py",
+  "codePath":  "text/train.py",
+  "codePathLocal":  "train.py",
+  "git":  {
+    "remote":  "https://github.com/idiap/sigma-gpt.git",
+    "commit":  "46c4a865b52c40470e5f960dcc75a753a200f0b7"
+  },
+  "email":  "leo.gagnon@mila.quebec",
+  "root":  "/home/mila/l/leo.gagnon/sigma-gpt/text",
+  "host":  "cn-a007.server.mila.quebec",
+  "executable":  "/network/scratch/l/leo.gagnon/sigma-gpt-venv/bin/python",
+  "cpu_count":  40,
+  "cpu_count_logical":  40,
+  "gpu":  "Quadro RTX 8000",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "1885880406016",
+      "used":  "21017948160"
+    }
+  },
+  "memory":  {
+    "total":  "405374214144"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "Quadro RTX 8000",
+      "memoryTotal":  "48318382080",
+      "cudaCores":  4608,
+      "architecture":  "Turing",
+      "uuid":  "GPU-b756121c-7ded-3464-8920-5197ddb50755"
+    }
+  ],
+  "cudaVersion":  "12.8",
+  "slurm":  {
+    "job_id":  "7341156"
+  },
+  "writerId":  "s3lznq1gys8zz4o5sxaq8fttg16isia3"
+}

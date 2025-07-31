@@ -52,9 +52,6 @@ def order(x, prompt_len, order_type="left-to-right"):
         x (torch.Tensor): Input sequence.
         prompt_len (int): Length of the prompt.
         order_type (str): Type of permutation (left-to-right).
-
-
-
     """
     if order_type == "random":
         order = torch.rand(x.size(), device=x.device)
@@ -69,6 +66,25 @@ def order(x, prompt_len, order_type="left-to-right"):
         return (
             torch.arange(x.size(1), device=x.device).unsqueeze(0).expand(x.size(0), -1)
         )
+    elif order_type == "block-conditioning":
+        B, T = x.size()
+        max_block = int(0.3 * T)
+        # Exponential distribution, skewed towards 0, but at least 1
+        # Use torch.distributions for reproducibility
+        exp = torch.distributions.Exponential(1.0)
+        block_sizes = exp.sample((B,)).to(x.device)
+        block_sizes = (block_sizes / block_sizes.max() * max_block).long().clamp(min=1, max=max_block)
+        block_starts = max_block - 1 + (torch.rand(B) * (T - block_sizes - max_block)).int()
+        orders = []
+        for b in range(B):
+            block = torch.arange(block_starts[b], block_starts[b] + block_sizes[b], device=x.device)
+            rest = torch.cat([
+                torch.arange(0, block_starts[b], device=x.device),
+                torch.arange(block_starts[b] + block_sizes[b], T, device=x.device)
+            ])
+            order = torch.cat([block, rest])
+            orders.append(order)
+        return torch.stack(orders, dim=0)
     else:
         raise ValueError("Unknown order type")
 
@@ -82,7 +98,7 @@ def order_mask(mask, order_type="left-to-right"):
         mask (torch.Tensor): Mask.
         order_type (str): Type of permutation (left-to-right/random).
     """
-    if order_type not in ["left-to-right", "random"]:
+    if order_type not in ["left-to-right", "random", "block-conditioning", "fractal"]:
         raise ValueError(f"order_mask not implemented for order type {order_type}")
 
     if order_type == "random":

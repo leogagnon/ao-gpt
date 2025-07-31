@@ -15,7 +15,7 @@ from torch.nn import functional as F
 from caching import KeysValues as original_KeysValues
 from caching import KVCache as original_KVCache
 from import_nanogpt import model
-from order import order_mask, reorder
+from order import order_mask, reorder, apply_order
 
 
 class KVCache(original_KVCache):
@@ -209,7 +209,7 @@ class CausalSelfAttention(model.CausalSelfAttention):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-    def forward(self, x, kv_cache=None, burst=False):
+    def forward(self, x, kv_cache=None, burst=False, padding_mask=None):
         """Forward pass of the CausalSelfAttention module add burst mode and kvcache."""
         # batch size, sequence length, embedding dimensionality (n_embd)
         (B, T, C) = x.size()
@@ -240,7 +240,7 @@ class CausalSelfAttention(model.CausalSelfAttention):
             kv_cache.update(k, v)
             k, v = kv_cache.get()
 
-        y = self.manual_self_attention(q, k, v, L, T)
+        y = self.manual_self_attention(q, k, v, L, T, padding_mask=padding_mask)
         # re-assemble all head outputs side by side
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
@@ -249,7 +249,7 @@ class CausalSelfAttention(model.CausalSelfAttention):
         return y
         # manual implementation of attention
 
-    def manual_self_attention(self, q, k, v, L, T):
+    def manual_self_attention(self, q, k, v, L, T, padding_mask=None):
         """Manual implementation of the self-attention.
 
         Flash attention with is_causal=True fails with cache because it takes the wrong mask.
@@ -270,12 +270,28 @@ class CausalSelfAttention(model.CausalSelfAttention):
 
         Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         """
+        assert torch.isnan(q).any() == False
+
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[L : L + T, : L + T] == 0, float("-inf"))
 
+
         att = F.softmax(att, dim=-1)
+
+        # Mask out padding tokens if padding_mask is provided
+        if padding_mask is not None:
+            # padding_mask: (B, S) where S = L+T (sequence length)
+            # We want to mask out keys that are padding (i.e., set attn to -inf)
+            # att: (B, nh, T, S)
+            mask = padding_mask[:, None, None, :]  # (B, 1, 1, S)
+            att = att.masked_fill(mask == 0, 0.0)
+
+
         att = self.attn_dropout(att)
-        return att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        out = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        return out
 
 
 class Block(nn.Module):
@@ -289,9 +305,11 @@ class Block(nn.Module):
         self.ln_2 = model.LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = model.MLP(config)
 
-    def forward(self, x, kv_cache=None, burst=False):
+    def forward(self, x, kv_cache=None, burst=False, padding_mask=None):
         """Forward pass of the Block module."""
-        x = x + self.attn(self.ln_1(x), kv_cache=kv_cache, burst=burst)
+        x = x + self.attn(
+            self.ln_1(x), kv_cache=kv_cache, burst=burst, padding_mask=padding_mask
+        )
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -366,8 +384,15 @@ class sigmaGPT(nn.Module):
         self, idx, order, targets=None, optimize=True, kv_cache=None, burst=False
     ):
         """Forward pass of the sigmaGPT model."""
-        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self._pos_emb(idx, order)  # position embeddings of shape (t, n_embd)
+        # Apply permutation to idx and targets according to order
+        idx_perm, targets_perm = apply_order(idx, order)
+
+        tok_emb = self.transformer.wte(
+            idx_perm
+        )  # token embeddings of shape (b, t, n_embd)
+        pos_emb = self._pos_emb(
+            idx_perm, order
+        )  # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
 
         for i, block in enumerate(self.transformer.h):
@@ -384,7 +409,7 @@ class sigmaGPT(nn.Module):
 
         logits = self.lm_head(x)
         loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
+            logits.view(-1, logits.size(-1)), targets_perm.view(-1), ignore_index=-1
         )
         return logits, loss
 
@@ -714,6 +739,186 @@ class sigmaGPT(nn.Module):
         return final, num_tokens - prompt_len
 
 
+class aoGPT(nn.Module):
+    """Auto-regressive Only GPT with block-conditioning.
+
+    This model only works with 'block-conditioning' order type.
+    It prepends the conditioning block (first block in the order) to the input,
+    and does next-token prediction as usual.
+    """
+
+    _init_weights = model.GPT._init_weights
+    get_num_params = model.GPT.get_num_params
+    configure_optimizers = model.GPT.configure_optimizers
+    estimate_mfu = model.GPT.estimate_mfu
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.vocab_size is not None
+        assert config.block_size is not None
+        self.padding_idx = config.vocab_size
+        self.sep_idx = config.vocab_size + 1  # conditioning separator token
+        config.vocab_size += 2  # +2 for padding and conditioning separator
+
+        self.config = config
+
+        self.transformer = nn.ModuleDict(
+            {
+                "wte": nn.Embedding(
+                    config.vocab_size, config.n_embd, padding_idx=self.padding_idx
+                ),
+                "wpe": nn.Embedding(config.block_size, config.n_embd),
+                "drop": nn.Dropout(config.dropout),
+                "h": nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                "ln_f": model.LayerNorm(config.n_embd, bias=config.bias),
+            }
+        )
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+        for pn, p in self.named_parameters():
+            if pn.endswith("c_proj.weight"):
+                torch.nn.init.normal_(
+                    p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
+                )
+
+        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
+
+    @staticmethod
+    def sinusoidal_pos_emb(length, dim, device, scale=1.0):
+        """Compute scaled sinusoidal positional embeddings."""
+        position = torch.arange(length, dtype=torch.float, device=device).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, dim, 2, dtype=torch.float, device=device)
+            * -(math.log(10000.0) / dim)
+        )
+        pe = torch.zeros(length, dim, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term * scale)
+        pe[:, 1::2] = torch.cos(position * div_term * scale)
+        return pe.unsqueeze(0)  # (1, length, dim)
+
+    def _pos_emb(self, idx):
+        t = idx.size(1)
+        assert (
+            t <= self.config.block_size
+        ), f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        # Use scaled sinusoidal embeddings instead of learned embeddings
+        return self.sinusoidal_pos_emb(t, self.config.n_embd, idx.device, scale=1.0)
+
+    def _get_block_lengths(self, order):
+        """Compute the length of the first contiguous block for each batch."""
+        diffs = (order[:, 1:] - order[:, :-1]).abs()
+        block_ends = diffs != 1
+        block_lengths = block_ends.float().argmax(dim=1) + 1
+        # If all diffs==1, then block is full length
+        all_contig = (diffs == 1).all(dim=1)
+        block_lengths[all_contig] = 0
+        return block_lengths
+
+    def _extract_conditioning(self, idx, order, block_lengths):
+        """Extract the conditioning block tokens and their positions for each batch."""
+        cond_tokens_list = []
+        cond_pos_list = []
+        B = idx.size(0)
+        for b in range(B):
+            blen = block_lengths[b].item()
+            cond_idx = order[b, :blen]
+            cond_tokens = idx[b].gather(0, cond_idx)
+            cond_tokens_list.append(cond_tokens)
+            cond_pos_list.append(cond_idx)
+        return cond_tokens_list, cond_pos_list
+
+    def forward(
+        self, idx, order, targets=None, optimize=True, kv_cache=None, burst=False
+    ):
+        """
+        Forward pass for block-conditioned GPT.
+        - Extracts the conditioning block from the input using the order.
+        - Prepends the conditioning block and separator to the input.
+        - Computes positional embeddings (sinusoidal).
+        - Runs transformer and computes loss if targets are provided.
+        """
+        assert torch.isnan(self.lm_head.weight).any() == False, "lm_head weights should not be NaN"
+        assert order is not None, "order must be provided"
+        B, T = idx.shape
+
+        # 1. Find conditioning block lengths and extract tokens/positions
+        block_lengths = self._get_block_lengths(order)
+        cond_tokens_list, cond_pos_list = self._extract_conditioning(
+            idx, order, block_lengths
+        )
+
+        # 2. Pad conditioning blocks and positions to same length
+        cond_prefix = torch.nn.utils.rnn.pad_sequence(
+            cond_tokens_list,
+            batch_first=True,
+            padding_value=self.padding_idx,
+            padding_side="left",
+        )
+        cond_pos = torch.nn.utils.rnn.pad_sequence(
+            cond_pos_list, batch_first=True, padding_value=0, padding_side="left"
+        )
+
+        # 3. Append separator token to conditioning block
+        sep_tok = torch.full((B, 1), self.sep_idx, device=idx.device)
+        sep_pos = torch.zeros((B, 1), device=idx.device, dtype=cond_pos.dtype)
+        cond_prefix = torch.cat([cond_prefix, sep_tok], dim=1)
+        cond_pos = torch.cat([cond_pos, sep_pos], dim=1)
+
+        # 4. Combine conditioning with input tokens (and positions)
+        input_idx = torch.cat([cond_prefix, idx], dim=1)
+        input_idx = input_idx[:, :-1].contiguous()  
+        input_pos = torch.cat(
+            [cond_pos, torch.arange(T, device=idx.device).unsqueeze(0).repeat(B, 1)],
+            dim=1,
+        )
+        input_pos = input_pos[:, :-1].contiguous()  # Remove last position
+        targets = idx
+
+        # 6. Sinusoidal positional embeddings
+        max_pos = input_pos.max().item() + 1
+        pe_table = self.sinusoidal_pos_emb(
+            max_pos, self.config.n_embd, idx.device, scale=1.0
+        ).squeeze(0)
+        pos_emb = F.embedding(input_pos, pe_table)
+
+        # 7. Token embeddings and padding mask
+        tok_emb = self.transformer.wte(input_idx)
+        padding_mask = (input_idx != self.padding_idx).long()
+        
+        # 8. Transformer blocks
+        x = self.transformer.drop(tok_emb + pos_emb)
+        if torch.isnan(x).any():
+            print('wat')
+
+        for i, block in enumerate(self.transformer.h):
+            x = block(
+                x,
+                None if kv_cache is None else kv_cache[i],
+                burst,
+                padding_mask=padding_mask,
+            )
+        x = self.transformer.ln_f(x)
+        x = x[:, -T:]  # Only predict sequence; not conditioning block
+
+        # 9. Output/logits/loss
+        if targets is None:
+            if optimize:
+                return self.lm_head(x[:, [-1], :]), None
+            return self.lm_head(x), None
+
+        logits = self.lm_head(x)
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=self.padding_idx,
+        )
+        if torch.isnan(loss):
+            print("wat")
+        return logits, loss
+
+
 COLS = 190
 MAX_BUFFER_SIZE = COLS * 20
 LINES = (MAX_BUFFER_SIZE // COLS) + 1
@@ -788,6 +993,10 @@ def refresh_lines(s, current=None, size=0, prompt=0):
 
     else:
         s = split(process(s))
+        sys.stdout.write(f"\033[{len(s)+1}A")
+        print(f"Total accepts: {current:<3}")
+        for line in s:
+            print(line)
         sys.stdout.write(f"\033[{len(s)+1}A")
         print(f"Total accepts: {current:<3}")
         for line in s:

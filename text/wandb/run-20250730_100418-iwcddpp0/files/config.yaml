@@ -1,0 +1,125 @@
+_wandb:
+    value:
+        cli_version: 0.21.0
+        e:
+            l6hy66zqmymec9ouvoe3ntcb9j070aja:
+                args:
+                    - --batch_size=32
+                    - --compile=False
+                codePath: text/train.py
+                codePathLocal: train.py
+                cpu_count: 40
+                cpu_count_logical: 40
+                cudaVersion: "12.8"
+                disk:
+                    /:
+                        total: "1885880406016"
+                        used: "21016731648"
+                email: leo.gagnon@mila.quebec
+                executable: /network/scratch/l/leo.gagnon/sigma-gpt-venv/bin/python
+                git:
+                    commit: 46c4a865b52c40470e5f960dcc75a753a200f0b7
+                    remote: https://github.com/idiap/sigma-gpt.git
+                gpu: Quadro RTX 8000
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Turing
+                      cudaCores: 4608
+                      memoryTotal: "48318382080"
+                      name: Quadro RTX 8000
+                      uuid: GPU-b756121c-7ded-3464-8920-5197ddb50755
+                host: cn-a007.server.mila.quebec
+                memory:
+                    total: "405374214144"
+                os: Linux-5.15.0-101-generic-x86_64-with-glibc2.35
+                program: /home/mila/l/leo.gagnon/sigma-gpt/text/train.py
+                python: CPython 3.10.11
+                root: /home/mila/l/leo.gagnon/sigma-gpt/text
+                slurm:
+                    job_id: "7341156"
+                startedAt: "2025-07-30T14:04:18.262970Z"
+                writerId: l6hy66zqmymec9ouvoe3ntcb9j070aja
+        m: []
+        python_version: 3.10.11
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 13
+                - 16
+            "4": 3.10.11
+            "5": 0.21.0
+            "12": 0.21.0
+            "13": linux-x86_64
+always_save_checkpoint:
+    value: true
+backend:
+    value: nccl
+batch_size:
+    value: 32
+beta1:
+    value: 0.9
+beta2:
+    value: 0.95
+bias:
+    value: false
+block_size:
+    value: 1024
+compile:
+    value: false
+data_dir_prefix:
+    value: /network/scratch/l/leo.gagnon/sigma-gpt-data
+dataset:
+    value: openwebtext
+decay_lr:
+    value: true
+device:
+    value: cuda
+dropout:
+    value: 0
+dtype:
+    value: float16
+eval_interval:
+    value: 2000
+eval_iters:
+    value: 200
+eval_only:
+    value: false
+grad_clip:
+    value: 1
+gradient_accumulation_steps:
+    value: 40
+init_from:
+    value: scratch
+learning_rate:
+    value: 0.0006
+log_interval:
+    value: 1
+lr_decay_iters:
+    value: 600000
+max_iters:
+    value: 600000
+min_lr:
+    value: 6e-05
+n_embd:
+    value: 768
+n_head:
+    value: 12
+n_layer:
+    value: 12
+order_type:
+    value: block-conditionning
+out_dir:
+    value: out
+wandb_log:
+    value: true
+wandb_project:
+    value: ao-gpt
+wandb_run_name:
+    value: test
+warmup_iters:
+    value: 2000
+weight_decay:
+    value: 0.1
