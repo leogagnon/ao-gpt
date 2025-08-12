@@ -39,7 +39,7 @@ from import_nanogpt import model
 from order import apply_order, order
 from sigmagpt import aoGPT, sigmaGPT
 
-torch.autograd.set_detect_anomaly(True)  # useful for debugging 
+# torch.autograd.set_detect_anomaly(True)  # useful for debugging 
 
 order_type = (
     "curriculum:block-conditioning"  # 'left-to-right', 'fractal', 'random', 'randomcurriculum'
@@ -48,7 +48,7 @@ model_type = "aoGPT"  # 'sigmaGPT', 'aoGPT'
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = "out"
+out_dir = "/network/scratch/l/leo.gagnon/sigma-gpt-log"
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -58,12 +58,12 @@ init_from = "scratch"  # 'scratch' or 'resume'
 # wandb logging
 wandb_log = True  # disabled by default
 wandb_project = "ao-gpt"
-wandb_run_name = "test"  # 'run' + str(time.time())
+wandb_run_name = "aoGPT"  # 'run' + str(time.time())
 # data
 dataset = "openwebtext"
 data_dir_prefix = "/network/scratch/l/leo.gagnon/sigma-gpt-data"
-gradient_accumulation_steps = 1 # 5 * 8 #5 * 8  # used to simulate larger batch sizes
-batch_size = 12  # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 5 * 8 #5 * 8  # used to simulate larger batch sizes
+batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -171,13 +171,16 @@ def get_batch(split, order_type=order_type, it=None):
         [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
     )
 
+    # Store original order_type for passing to model
+    effective_order_type = order_type
+
     if order_type == "curriculumrandom":
-        order_type = (
+        effective_order_type = (
             "left-to-right" if torch.rand(1).item() > (it / max_iters) else "random"
         )
 
     if order_type.startswith("curriculum:"):
-        order_type = (
+        effective_order_type = (
             order_type.split(":")[1]
             if torch.rand(1).item() > (it / max_iters)
             else "left-to-right"
@@ -186,9 +189,9 @@ def get_batch(split, order_type=order_type, it=None):
     if order_type.startswith("randcur:"):
         perc = float(order_type.split(":")[1]) / 100
         ratio = perc + (it / max_iters) * (1 - perc)
-        order_type = "left-to-right" if torch.rand(1).item() > ratio else "random"
+        effective_order_type = "left-to-right" if torch.rand(1).item() > ratio else "random"
 
-    o = order(x, 0, order_type).contiguous()
+    o = order(x, 0, effective_order_type).contiguous()
     y = x.clone()  # y is the original target (no permutation applied)
 
     if device_type == "cuda":
@@ -198,7 +201,7 @@ def get_batch(split, order_type=order_type, it=None):
         y = y.pin_memory().to(device, non_blocking=True)
     else:
         x, o, y = x.to(device), o.to(device), y.to(device)
-    return x, o, y
+    return x, o, y, effective_order_type
 
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -237,6 +240,7 @@ if init_from == "scratch":
     gptconf = model.GPTConfig(**model_args)
     if model_type == "sigmaGPT":
         print("Creating a sigmaGPT model")
+        gptconf.block_size = gptconf.block_size + 1
         model = sigmaGPT(gptconf)
     elif model_type == "aoGPT":
         print("Creating an aoGPT model")
@@ -318,10 +322,10 @@ def estimate_loss(it):
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             o = "left-to-right" if split == "val_left-to-right" else order_type
-            X, O, Y = get_batch(split, o, it)
+            X, O, Y, effective_order_type = get_batch(split, o, it)
 
             with ctx:
-                _, loss = model(X, O, Y)
+                _, loss = model(X, O, Y, order_type=effective_order_type)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -355,7 +359,7 @@ if wandb_log and master_process:
 print("Starting training loop")
 # print(f"Current memory usage: {virtual_memory().used / (1024 ** 3):.2f} GB")
 # training loop
-X, O, Y = get_batch("train", it=0)  # fetch the very first batch
+X, O, Y, current_order_type = get_batch("train", it=0)  # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
@@ -376,7 +380,7 @@ while True:
     # print(f"Current memory usage: {virtual_memory().used / (1024 ** 3):.2f} GB")
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process and False:
+    if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss(iter_num)
         print(
             f"step {iter_num}: train loss {losses['train']:.4f},"
@@ -422,13 +426,13 @@ while True:
                 micro_step == gradient_accumulation_steps - 1
             )
         with ctx:
-            logits, loss = model(X, O, Y)
+            logits, loss = model(X, O, Y, order_type=current_order_type)
             loss = (
                 loss / gradient_accumulation_steps
             )  # scale the loss to account for gradient accumulation
 
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, O, Y = get_batch("train", it=iter_num)
+        X, O, Y, current_order_type = get_batch("train", it=iter_num)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient

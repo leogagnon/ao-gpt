@@ -15,7 +15,7 @@ from torch.nn import functional as F
 from caching import KeysValues as original_KeysValues
 from caching import KVCache as original_KVCache
 from import_nanogpt import model
-from order import order_mask, reorder, apply_order
+from order import order_mask, reorder, apply_order, get_conditioning_block_lengths
 
 
 class KVCache(original_KVCache):
@@ -275,7 +275,6 @@ class CausalSelfAttention(model.CausalSelfAttention):
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[L : L + T, : L + T] == 0, float("-inf"))
 
-
         att = F.softmax(att, dim=-1)
 
         # Mask out padding tokens if padding_mask is provided
@@ -285,7 +284,6 @@ class CausalSelfAttention(model.CausalSelfAttention):
             # att: (B, nh, T, S)
             mask = padding_mask[:, None, None, :]  # (B, 1, 1, S)
             att = att.masked_fill(mask == 0, 0.0)
-
 
         att = self.attn_dropout(att)
 
@@ -323,10 +321,12 @@ class sigmaGPT(nn.Module):
     estimate_mfu = model.GPT.estimate_mfu
 
     def __init__(self, config):
-        """Initialize the sigmaGPT model."""
+        """Initialize the sigmaGPT model with a BOS token."""
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+        self.bos_idx = config.vocab_size  # BOS token index
+        config.vocab_size += 1  # Add BOS token to vocab
         self.config = config
 
         self.transformer = nn.ModuleDict(
@@ -341,13 +341,7 @@ class sigmaGPT(nn.Module):
             }
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = (
-            self.lm_head.weight
-        )  # https://paperswithcode.com/method/weight-tying
+        self.transformer.wte.weight = self.lm_head.weight
 
         # init all weights
         self.apply(self._init_weights)
@@ -381,18 +375,36 @@ class sigmaGPT(nn.Module):
         return self.transformer.wpe(order).flatten(2)
 
     def forward(
-        self, idx, order, targets=None, optimize=True, kv_cache=None, burst=False
+        self,
+        idx,
+        order,
+        targets=None,
+        optimize=True,
+        kv_cache=None,
+        burst=False,
+        order_type=None,
     ):
-        """Forward pass of the sigmaGPT model."""
+        """Forward pass of the sigmaGPT model with BOS token."""
         # Apply permutation to idx and targets according to order
-        idx_perm, targets_perm = apply_order(idx, order)
+        idx_perm = idx.gather(1, order)
 
-        tok_emb = self.transformer.wte(
-            idx_perm
-        )  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self._pos_emb(
-            idx_perm, order
-        )  # position embeddings of shape (t, n_embd)
+        # Prepend BOS token after shuffling
+        bos = torch.full((idx_perm.size(0), 1), self.bos_idx, dtype=idx_perm.dtype, device=idx_perm.device)
+        idx_perm = torch.cat([bos, idx_perm], dim=1)
+
+        # Set targets
+        targets_perm = idx_perm.clone()
+        targets_perm = targets_perm[:, 1:].contiguous()  # Remove BOS token from targets
+
+        # Remove last token from idx
+        idx_perm = idx_perm[:, :-1].contiguous()        
+
+        # Adjust order for BOS token (always 0 at the start)
+        bos_order = torch.zeros((order.size(0), 1), dtype=order.dtype, device=order.device)
+        order = torch.cat([bos_order, order + 1], dim=1)
+
+        tok_emb = self.transformer.wte(idx_perm)
+        pos_emb = self._pos_emb(idx_perm, order)
         x = self.transformer.drop(tok_emb + pos_emb)
 
         for i, block in enumerate(self.transformer.h):
@@ -408,9 +420,31 @@ class sigmaGPT(nn.Module):
             return self.lm_head(x), None
 
         logits = self.lm_head(x)
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), targets_perm.view(-1), ignore_index=-1
-        )
+
+        # Handle conditioning block masking for block-conditioning
+        if order_type == "block-conditioning":
+            # Get conditioning block lengths
+            block_lengths = get_conditioning_block_lengths(
+                order[:, 1:]
+            )  # remove BOS token
+
+            # Create mask to exclude conditioning block from loss
+            B, T = targets_perm.shape
+            loss_mask = torch.zeros_like(targets_perm, dtype=torch.bool)
+
+            for b in range(B):
+                loss_mask[b, : block_lengths[b]] = True
+
+            targets_perm[loss_mask] = -1  # Set conditioning tokens to -1 for loss
+
+            # Compute loss only on the non-conditioning tokens
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets_perm.view(-1), ignore_index=-1)
+        else:
+            # Standard loss computation
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets_perm.view(-1), ignore_index=-1
+            )
+
         return logits, loss
 
     @torch.no_grad()
@@ -822,7 +856,7 @@ class aoGPT(nn.Module):
         cond_pos_list = []
         B = idx.size(0)
         for b in range(B):
-            blen = block_lengths[b].item()
+            blen = block_lengths[b]
             cond_idx = order[b, :blen]
             cond_tokens = idx[b].gather(0, cond_idx)
             cond_tokens_list.append(cond_tokens)
@@ -830,7 +864,14 @@ class aoGPT(nn.Module):
         return cond_tokens_list, cond_pos_list
 
     def forward(
-        self, idx, order, targets=None, optimize=True, kv_cache=None, burst=False
+        self,
+        idx,
+        order,
+        targets=None,
+        optimize=True,
+        kv_cache=None,
+        burst=False,
+        order_type=None,
     ):
         """
         Forward pass for block-conditioned GPT.
@@ -839,7 +880,9 @@ class aoGPT(nn.Module):
         - Computes positional embeddings (sinusoidal).
         - Runs transformer and computes loss if targets are provided.
         """
-        assert torch.isnan(self.lm_head.weight).any() == False, "lm_head weights should not be NaN"
+        assert (
+            torch.isnan(self.lm_head.weight).any() == False
+        ), "lm_head weights should not be NaN"
         assert order is not None, "order must be provided"
         B, T = idx.shape
 
@@ -868,7 +911,7 @@ class aoGPT(nn.Module):
 
         # 4. Combine conditioning with input tokens (and positions)
         input_idx = torch.cat([cond_prefix, idx], dim=1)
-        input_idx = input_idx[:, :-1].contiguous()  
+        input_idx = input_idx[:, :-1].contiguous()
         input_pos = torch.cat(
             [cond_pos, torch.arange(T, device=idx.device).unsqueeze(0).repeat(B, 1)],
             dim=1,
@@ -886,11 +929,11 @@ class aoGPT(nn.Module):
         # 7. Token embeddings and padding mask
         tok_emb = self.transformer.wte(input_idx)
         padding_mask = (input_idx != self.padding_idx).long()
-        
+
         # 8. Transformer blocks
         x = self.transformer.drop(tok_emb + pos_emb)
         if torch.isnan(x).any():
-            print('wat')
+            print("wat")
 
         for i, block in enumerate(self.transformer.h):
             x = block(
@@ -909,11 +952,28 @@ class aoGPT(nn.Module):
             return self.lm_head(x), None
 
         logits = self.lm_head(x)
+
+        # Create mask to exclude conditioning block tokens from loss
+        # block_lengths contains the length of conditioning block for each batch
+        loss_mask = torch.zeros_like(targets, dtype=torch.bool)
+
+        for b in range(B):
+            block_len = block_lengths[b].item()
+            if block_len > 0:
+                # Get the positions of conditioning block tokens in the original sequence
+                cond_positions = cond_pos_list[b]  # These are the original positions
+                # Mask out these positions from the loss
+                loss_mask[b, cond_positions] = True
+
+        # Apply mask to logits and targets
+        targets[loss_mask] = -1
+
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
-            ignore_index=self.padding_idx,
+            ignore_index=-1,
         )
+
         if torch.isnan(loss):
             print("wat")
         return logits, loss

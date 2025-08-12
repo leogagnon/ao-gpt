@@ -165,6 +165,34 @@ def reorder(x, order, reverse=False):  # x is NxTxD1x...xDk, order is NxT'
     return v
 
 
+def get_conditioning_block_lengths(order):
+    """Get the length of the conditioning block for each batch element.
+    
+    For block-conditioning, the conditioning block is the first contiguous
+    sequence of consecutive indices in the order.
+    
+    Args:
+        order (torch.Tensor): Order tensor of shape (B, T).
+        
+    Returns:
+        torch.Tensor: Block lengths for each batch element of shape (B,).
+    """
+    B, T = order.shape
+    block_lengths = torch.ones(B, dtype=torch.long, device=order.device)
+    
+    for b in range(B):
+        # Find where the consecutive sequence breaks
+        for t in range(1, T):
+            if order[b, t] != order[b, t-1] + 1:
+                block_lengths[b] = t
+                break
+        else:
+            # If we never break, the whole sequence is the block
+            block_lengths[b] = T
+    
+    return block_lengths
+
+
 def apply_order(x, o):
     """Apply the order to the sequence.
 
@@ -177,10 +205,8 @@ def apply_order(x, o):
     """
     y = x.clone()
     x = x.gather(1, o)
-    x = x[:, :-1]
     x = x.contiguous()
 
     y = y.gather(1, o)
-    y = y[:, 1:]
     y = y.contiguous()
     return x, y
