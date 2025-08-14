@@ -22,6 +22,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
+
 import math
 import os
 import pickle
@@ -44,7 +45,7 @@ from sigmagpt import aoGPT, sigmaGPT
 order_type = (
     "curriculum:block-conditioning"  # 'left-to-right', 'fractal', 'random', 'randomcurriculum'
 )
-model_type = "aoGPT"  # 'sigmaGPT', 'aoGPT'
+model_type = 'aoGPT' # 'sigmaGPT', 'aoGPT'
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -58,11 +59,11 @@ init_from = "scratch"  # 'scratch' or 'resume'
 # wandb logging
 wandb_log = True  # disabled by default
 wandb_project = "ao-gpt"
-wandb_run_name = "aoGPT"  # 'run' + str(time.time())
+wandb_run_name = model_type + str(time.time())
 # data
 dataset = "openwebtext"
 data_dir_prefix = "/network/scratch/l/leo.gagnon/sigma-gpt-data"
-gradient_accumulation_steps = 5 * 8 #5 * 8  # used to simulate larger batch sizes
+gradient_accumulation_steps = 1#5 * 8 #5 * 8  # used to simulate larger batch sizes
 batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
@@ -380,7 +381,7 @@ while True:
     # print(f"Current memory usage: {virtual_memory().used / (1024 ** 3):.2f} GB")
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num % eval_interval == 0 and master_process and False:
         losses = estimate_loss(iter_num)
         print(
             f"step {iter_num}: train loss {losses['train']:.4f},"
